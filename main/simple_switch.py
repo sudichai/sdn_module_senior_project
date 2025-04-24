@@ -1,5 +1,3 @@
-# simple_switch.py
-
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
@@ -8,7 +6,6 @@ from ryu.ofproto import ofproto_v1_3
 from packet_in_handler import PacketInHandler
 from switch_features_handler import SwitchFeaturesHandler
 from flow_stats_handler import FlowStatsHandler 
-
 
 class SimpleSwitch13(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -31,10 +28,8 @@ class SimpleSwitch13(app_manager.RyuApp):
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
             self.flow_stats_handler.datapaths[datapath.id] = datapath  
-
         elif ev.state == CONFIG_DISPATCHER:
             self.flow_stats_handler.datapaths.pop(datapath.id, None) 
-
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler_wrapper(self, ev):
@@ -46,3 +41,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         """Handle flow stats reply events."""
         self.flow_stats_handler.flow_stats_reply_handler(ev)
 
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def port_stats_reply_handler(self, ev):
+        """Handle port stats reply events."""
+        self.flow_stats_handler._port_stats_reply_handler(ev)

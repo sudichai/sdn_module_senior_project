@@ -1,8 +1,7 @@
-#flow_stats_handler.py
-
 import csv
 import os
 from datetime import datetime
+from time import time
 from collections import defaultdict
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -20,7 +19,7 @@ class FlowStatsHandler(app_manager.RyuApp):
     """Ryu application for handling flow statistics and DDoS detection."""
     
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
-    PROTECTED_SRC = "00:00:00:00:00:13"  # Protected source MAC address
+    SERVER_SRC = "00:00:00:00:00:13"
 
     def __init__(self, *args, **kwargs):
         """Initialize the application."""
@@ -30,6 +29,16 @@ class FlowStatsHandler(app_manager.RyuApp):
         # File paths for CSV outputs
         self.output_file = '/home/wifi/sdn/main/flow_stats.csv'
         self.action_log_file = '/home/wifi/sdn/main/action_log.csv'
+        self.port_stats_history = {}
+        self.start_time = time()
+        self.seconds_since_start = 0
+        # Cache for SQL logging
+        self.stats_cache = defaultdict(lambda: {
+            'rx_bytes_per_sec': 0.0,
+            'tx_bytes_per_sec': 0.0,
+            'cpu_util': None,
+            'logged': False
+        })
         
         # Initialize datapaths, meter ID, and connections
         self.datapaths = {}
@@ -38,8 +47,8 @@ class FlowStatsHandler(app_manager.RyuApp):
         self.db = None
         self._init_connections()
         
-        # Cache for DDoS detection counts
-        self.ddos_detection_count = defaultdict(int)
+        # Cache for DDoS detection counts, separated by datapath
+        self.ddos_detection_count = defaultdict(lambda: defaultdict(int))
         self.action_log = []
 
         # Map protocol numbers to names
@@ -64,7 +73,6 @@ class FlowStatsHandler(app_manager.RyuApp):
             handlers=[logging.StreamHandler()]
         )
         self.logger = logging.getLogger(__name__)
-        # Suppress Paramiko's debug logs
         logging.getLogger("paramiko").setLevel(logging.WARNING)
 
     def _init_connections(self):
@@ -72,8 +80,8 @@ class FlowStatsHandler(app_manager.RyuApp):
         self._init_ssh()
         try:
             self.db = mysql.connector.connect(
-                host="`host",  
-                port=47000, 
+                host="172.20.10.3",  
+                port=3306, 
                 user="root",
                 password="47363",
                 database="sdn"
@@ -83,7 +91,6 @@ class FlowStatsHandler(app_manager.RyuApp):
             self.logger.error(f"MySQL connection failed: {e}")
             self.db = None
 
-        # Create CSV file if it doesn't exist
         if not os.path.exists(self.output_file):
             self._create_csv_headers()
 
@@ -93,7 +100,8 @@ class FlowStatsHandler(app_manager.RyuApp):
             self.ssh_client = paramiko.SSHClient()
             self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             self.ssh_client.connect(
-                hostname="127.0.0.1",
+                hostname="172.20.10.5",
+                #hostname="127.0.0.1",
                 port=22,
                 username="wifi",
                 password="wifi",
@@ -118,11 +126,10 @@ class FlowStatsHandler(app_manager.RyuApp):
     def _create_csv_headers(self):
         """Create headers for flow stats CSV file."""
         headers = [
-            'Timestamp', 'Eth Src', 'Eth Dst', 'Protocol', 'Packets',
-            'Bytes', 'Packet Rate', 'Byte Rate', 'CPU Util (%)',
-            'Duration (s)', 'Duration (ns)', 'Datapath', 'Match',
-            'Priority', 'Idle Timeout', 'Hard Timeout', 'In Port',
-            'Instructions', 'Prediction'
+            'Seconds Since Start', 'Real Timestamp', 'Ethernet Src', 'Ethernet Dst', 'Protocol',
+            'Packet Count', 'Byte Count', 'Packet Rate', 'Byte Rate', 'CPU utilization',
+            'Duration (sec)', 'Duration (nsec)', 'Prediction', 'Priority', 'Idle Timeout',
+            'Hard Timeout', 'Datapath', 'Match Fields', 'Instructions'
         ]
         with open(self.output_file, 'w', newline='') as f:
             csv.writer(f).writerow(headers)
@@ -130,22 +137,34 @@ class FlowStatsHandler(app_manager.RyuApp):
     def _init_action_log_csv(self):
         """Initialize action log CSV file."""
         if not os.path.exists(self.action_log_file):
-            headers = ['Timestamp', 'Eth Src', 'Action']
+            headers = ['Seconds Since Start', 'Datapath', 'Eth Src', 'Eth Dst', 'Count', 'Action']
             with open(self.action_log_file, 'w', newline='') as f:
                 csv.writer(f).writerow(headers)
 
     def _monitor(self):
         """Periodically request flow statistics from datapaths."""
         while True:
+            self.seconds_since_start = int(time() - self.start_time)
             for dp in self.datapaths.values():
                 self._request_flow_stats(dp)
+                self._request_port_stats(dp)
             hub.sleep(5)
 
     def _request_flow_stats(self, datapath):
-        """Send flow stats request to a datapath."""
+        """Send flow stats request to the specified datapath."""
+        ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        datapath.send_msg(parser.OFPFlowStatsRequest(datapath, match=parser.OFPMatch()))
-        self.logger.debug(f"Requested flow stats from datapath {datapath.id}")
+        req = parser.OFPFlowStatsRequest(datapath, match=parser.OFPMatch())
+        datapath.send_msg(req)
+        self.logger.info(f"Requesting flow stats from switch: {datapath.id}")
+
+    def _request_port_stats(self, datapath):
+        """Send port stats request to the specified datapath."""
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+        datapath.send_msg(req)
+        self.logger.info(f"Requesting port stats from switch: {datapath.id}")
 
     def _get_cpu_utilization(self):
         """Retrieve CPU utilization via SSH."""
@@ -193,15 +212,19 @@ class FlowStatsHandler(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         stats = ev.msg.body
 
-        # Create meter if not already created
         if not hasattr(self, 'meter_created'):
             self._create_meter(datapath)
             self.meter_created = True
 
         cpu_util = self._get_cpu_utilization()
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        seconds_since_start = self.seconds_since_start
+        real_timestamp = datetime.fromtimestamp(self.start_time + seconds_since_start).strftime('%Y-%m-%d %H:%M:%S')
         total_bytes, total_packets = 0, 0
         prediction = "NoFlowData"
+
+        # Store CPU utilization in cache
+        cache_key = (seconds_since_start, datapath.id)
+        self.stats_cache[cache_key]['cpu_util'] = cpu_util
 
         with open(self.output_file, 'a', newline='') as f:
             writer = csv.writer(f)
@@ -230,18 +253,19 @@ class FlowStatsHandler(app_manager.RyuApp):
                     'Byte Rate': byte_rate,
                     'CPU utilization': cpu_util
                 }])
-
-                prediction = self._detect_ddos(datapath, parser, features, eth_src, eth_dst, protocol)
+                if self._extract_instructions(stat) != []:
+                    prediction = self._detect_ddos(datapath, parser, features, eth_src, eth_dst, protocol, duration)
 
                 writer.writerow([
-                    timestamp, eth_src, eth_dst, proto_name, stat.packet_count,
-                    stat.byte_count, f"{pkt_rate:.2f}", f"{byte_rate:.2f}", cpu_util,
-                    stat.duration_sec, stat.duration_nsec, datapath.id, str(match),
-                    stat.priority, stat.idle_timeout, stat.hard_timeout, match.get('in_port', "N/A"),
-                    str(self._extract_instructions(stat)), prediction
+                    seconds_since_start, real_timestamp, eth_src, eth_dst, proto_name,
+                    stat.packet_count, stat.byte_count, f"{pkt_rate:.2f}", f"{byte_rate:.2f}",
+                    cpu_util, stat.duration_sec, stat.duration_nsec, prediction,
+                    stat.priority, stat.idle_timeout, stat.hard_timeout, datapath.id,
+                    str(match), str(self._extract_instructions(stat))
                 ])
 
-        self._log_to_db(timestamp, datapath.id, total_bytes, total_packets, cpu_util, prediction)
+        # Attempt to log to DB if all data is available
+        self._log_to_db(seconds_since_start, real_timestamp, datapath.id)
 
     def _is_valid_flow(self, stat):
         """Check if a flow is valid for processing."""
@@ -252,7 +276,7 @@ class FlowStatsHandler(app_manager.RyuApp):
             stat.packet_count > 0 and stat.byte_count > 0
         )
 
-    def _detect_ddos(self, datapath, parser, features, eth_src, eth_dst, protocol):
+    def _detect_ddos(self, datapath, parser, features, eth_src, eth_dst, protocol, duration):
         """Detect DDoS attacks and apply mitigation based on detection count."""
         proto_name = self.protocol_map.get(protocol, "Unknown")
         model = self.rf_models.get(protocol)
@@ -265,98 +289,78 @@ class FlowStatsHandler(app_manager.RyuApp):
             prediction = model.predict(features_subset)[0]
             probs = model.predict_proba(features_subset)[0]
             prob_dict = dict(zip(model.classes_, probs))
+            if duration == 0 or eth_src == self.SERVER_SRC:
+                return prediction
 
-            # Log traffic analysis details
-            self.logger.info(f"\nTraffic Analysis:")
+            self.logger.info(f"\nTraffic Analysis from ap{datapath.id}:")
             self.logger.info(f"  Source: {eth_src} -> Destination: {eth_dst}")
             self.logger.info(f"  Protocol: {proto_name}")
             self.logger.info(f"  Prediction: {prediction}")
             self.logger.info(f"  CPU Usage: {features['CPU utilization'].iloc[0]:.2f}%")
             self.logger.info(f"  Probabilities:")
+            match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, eth_dst=eth_dst, eth_src=eth_src, ip_proto=protocol)
             for cls, prob in prob_dict.items():
                 self.logger.info(f"    {cls}: {prob:.2f}")
 
             max_prob = max(probs)
-            cache_key = f"{eth_src}_{prediction}"
-            if prediction in ["DDoS_ICMP", "DDoS_TCP"] and max_prob >= 0.9:  # Fixed: Use max_prob instead of prediction
-                if eth_src == self.PROTECTED_SRC:
-                    self.logger.info(f"  Skipping mitigation for protected source {eth_src}")
-                    return prediction
+            dpid = datapath.id
+            if prediction in ["DDoS_ICMP", "DDoS_TCP"] and max_prob >= 0.9:
+                self.ddos_detection_count[dpid][eth_src] += 1
+                count = self.ddos_detection_count[dpid][eth_src]
+                self.logger.info(f"  Detection count for dp:{dpid}, src:{eth_src} = {count}")
 
-                self.ddos_detection_count[cache_key] += 1
-                self.logger.info(f"  Detection count: {self.ddos_detection_count[cache_key]}")
-
-                # Apply mitigation based on detection count
-                if self.ddos_detection_count[cache_key] > 4:
-                    self.logger.info(f"  Permanent block triggered for {eth_src}")
-                    self._apply_permanent_block(datapath, parser, eth_src, prediction)
-                elif self.ddos_detection_count[cache_key] > 2:
-                    self.logger.info(f"  Temporary block triggered for {eth_src}")
-                    self._apply_temp_block(datapath, parser, eth_src, prediction)
-            elif max_prob >= 0.5:
-                self._apply_rate_limit(datapath, parser, eth_src, prediction, 500)  # Fixed: Removed erroneous self parameter
+                if count > 4:
+                    self.logger.info(f"\033[31m*** Permanent block triggered for {eth_src} ***\033[0m")
+                    self._remove_prior_flows(datapath, parser, eth_src, eth_dst, protocol)
+                    self.add_flow(datapath, 20, match, [], 600, 600)
+                    self._log_action(dpid, eth_src, eth_dst, count, "perm_block")
+                elif count > 2:
+                    self.logger.info(f"\033[31mTemporary block triggered for {eth_src}\033[0m")
+                    self._remove_prior_flows(datapath, parser, eth_src, eth_dst, protocol)
+                    self.add_flow(datapath, 10, match, [], 30, 20)
+                    self._log_action(dpid, eth_src, eth_dst, count, "temp_block")
+            elif prediction in ["DDoS_ICMP", "DDoS_TCP"] and max_prob >= 0.5:
                 self.logger.info(f"  Rate Limiting triggered for {eth_src}")
+                self._apply_rate_limit(datapath, parser, eth_src, eth_dst, prediction, 100)
             return prediction
         except Exception as e:
             self.logger.error(f"Classification error for {proto_name}: {e}")
             return "Unknown"
 
-    def _apply_temp_block(self, datapath, parser, eth_src, prediction):
-        """Apply a temporary block rule for a source."""
-        self._add_drop_rule(datapath, parser, eth_src, idle_timeout=10, hard_timeout=15)
-        action = f"Temporary Block (Prediction: {prediction}, Detection Count: {self.ddos_detection_count[f'{eth_src}_{prediction}']})"
-        self._log_action(eth_src, action)
-        self.logger.info(f"\033[31m  Action: {action}\033[0m")
-
-    def _apply_permanent_block(self, datapath, parser, eth_src, prediction):
-        """Apply a permanent block rule for a source, removing previous temporary rules."""
+    def _remove_prior_flows(self, datapath, parser, eth_src, eth_dst, protocol):
+        """Remove existing flow rules that allow traffic from eth_src to eth_dst for the given protocol."""
         ofproto = datapath.ofproto
-        # Remove existing temporary rules to avoid conflicts
-        match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, eth_src=eth_src)
-        datapath.send_msg(parser.OFPFlowMod(
+        match = parser.OFPMatch(
+            eth_type=ether_types.ETH_TYPE_IP,
+            eth_src=eth_src,
+            eth_dst=eth_dst,
+            ip_proto=protocol
+        )
+        flow_mod = parser.OFPFlowMod(
             datapath=datapath,
             command=ofproto.OFPFC_DELETE,
             out_port=ofproto.OFPP_ANY,
             out_group=ofproto.OFPG_ANY,
             match=match
-        ))
-        # Add permanent block rule
-        self._add_drop_rule(datapath, parser, eth_src, idle_timeout=0, hard_timeout=0)
-        action = f"Permanent Block (Prediction: {prediction}, Detection Count: {self.ddos_detection_count[f'{eth_src}_{prediction}']})"
-        self._log_action(eth_src, action)
-        self.logger.info(f"\033[31m  Action: {action}\033[0m")
+        )
+        datapath.send_msg(flow_mod)
+        self.logger.info(f"Removed prior flow rules for src:{eth_src}, dst:{eth_dst}, proto:{self.protocol_map.get(protocol, 'Unknown')}")
 
-    def _apply_rate_limit(self, datapath, parser, eth_src, prediction, rate):
+    def _apply_rate_limit(self, datapath, parser, eth_src, eth_dst, prediction, rate):
         """Apply a rate limit rule for a source."""
-        self._add_rate_limit_rule(datapath, parser, eth_src, rate)
-        action = f"Rate Limit at {rate}kbps (Prediction: {prediction})"
-        self._log_action(eth_src, action)
+        self._add_rate_limit_rule(datapath, parser, eth_src, eth_dst, rate)
+        action = f"Rate Limit at {rate} kBps"
+        self._log_action(datapath.id, eth_src, eth_dst, 0, action)
         self.logger.info(f"\033[33m  Action: {action}\033[0m")
 
-    def _log_action(self, eth_src, action):
+    def _log_action(self, datapath_id, eth_src, eth_dst, count, action):
         """Log mitigation action to CSV file."""
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        self.action_log.append((timestamp, eth_src, action))
+        seconds_since_start = self.seconds_since_start
+        self.action_log.append((seconds_since_start, datapath_id, eth_src, eth_dst, count, action))
         with open(self.action_log_file, 'a', newline='') as f:
-            csv.writer(f).writerow([timestamp, eth_src, action])
+            csv.writer(f).writerow([seconds_since_start, datapath_id, eth_src, eth_dst, count, action])
 
-    def _add_drop_rule(self, datapath, parser, eth_src, idle_timeout, hard_timeout):
-        """Add an OpenFlow rule to drop packets from a source."""
-        ofproto = datapath.ofproto
-        match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, eth_src=eth_src)
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, [])]
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=10,
-            match=match,
-            instructions=inst,
-            idle_timeout=idle_timeout,
-            hard_timeout=hard_timeout
-        )
-        datapath.send_msg(mod)
-        self.logger.info(f"Added drop rule for {eth_src} (Idle: {idle_timeout}s, Hard: {hard_timeout}s)")
-
-    def _add_rate_limit_rule(self, datapath, parser, eth_src, rate):
+    def _add_rate_limit_rule(self, datapath, parser, eth_src, eth_dst, rate):
         """Add an OpenFlow rule to limit packet rate from a source."""
         ofproto = datapath.ofproto
         meter_id = self.meter_id
@@ -368,7 +372,7 @@ class FlowStatsHandler(app_manager.RyuApp):
             meter_id=meter_id,
             bands=bands
         ))
-        match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, eth_src=eth_src)
+        match = parser.OFPMatch(eth_src=eth_src, eth_dst=eth_dst)
         actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
         inst = [
             parser.OFPInstructionMeter(meter_id=meter_id, type_=ofproto.OFPIT_METER),
@@ -385,23 +389,86 @@ class FlowStatsHandler(app_manager.RyuApp):
         self.meter_id += 1
         self.logger.info(f"Added rate limit for {eth_src} at {rate}kbps")
 
-    def _log_to_db(self, timestamp, datapath_id, total_bytes, total_packets, cpu_util, prediction):
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+        """Handle port statistics reply from datapath."""
+        body = ev.msg.body
+        dpid = ev.msg.datapath.id
+        seconds_since_start = self.seconds_since_start
+
+        # Aggregate RX/TX bytes per second across all ports
+        total_rx_bytes_per_sec = 0.0
+        total_tx_bytes_per_sec = 0.0
+        for stat in body:
+            port_no = stat.port_no
+            tx_bytes = stat.tx_bytes
+            rx_bytes = stat.rx_bytes
+            key = (dpid, port_no)
+            if key in self.port_stats_history:
+                prev_tx_bytes, prev_rx_bytes, prev_seconds = self.port_stats_history[key]
+                duration = seconds_since_start - prev_seconds
+                if duration > 0:
+                    tx_bytes_per_sec = (tx_bytes - prev_tx_bytes) / duration
+                    rx_bytes_per_sec = (rx_bytes - prev_rx_bytes) / duration
+                else:
+                    tx_bytes_per_sec = 0.0
+                    rx_bytes_per_sec = 0.0
+            else:
+                tx_bytes_per_sec = 0.0
+                rx_bytes_per_sec = 0.0
+            self.port_stats_history[key] = (tx_bytes, rx_bytes, seconds_since_start)
+            total_rx_bytes_per_sec += rx_bytes_per_sec
+            total_tx_bytes_per_sec += tx_bytes_per_sec
+            self.logger.info(
+                f"[ap{dpid}] Port {port_no}: TX {tx_bytes_per_sec:.2f} Bps | RX {rx_bytes_per_sec:.2f} Bps"
+            )
+
+        # Store aggregated RX/TX bytes per second in cache
+        cache_key = (seconds_since_start, dpid)
+        self.stats_cache[cache_key]['rx_bytes_per_sec'] = total_rx_bytes_per_sec
+        self.stats_cache[cache_key]['tx_bytes_per_sec'] = total_tx_bytes_per_sec
+
+        # Attempt to log to DB if all data is available
+        real_timestamp = datetime.fromtimestamp(self.start_time + seconds_since_start).strftime('%Y-%m-%d %H:%M:%S')
+        self._log_to_db(seconds_since_start, real_timestamp, dpid)
+
+    def _log_to_db(self, seconds_since_start, real_timestamp, datapath_id):
         """Log flow statistics to MySQL database."""
         if not self.db:
             return
-        try:
-            cursor = self.db.cursor()
-            sql = """
-                INSERT INTO flow_stats (timestamp, datapath_id, total_byte_count,
-                total_packet_count, cpu_utilization, prediction)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """
-            cursor.execute(sql, (timestamp, datapath_id, total_bytes, total_packets, cpu_util, prediction))
-            self.db.commit()
-            self.logger.debug(f"Logged to DB: {cursor.rowcount} row(s)")
-            cursor.close()
-        except Exception as e:
-            self.logger.error(f"DB insert failed: {e}")
+
+        cache_key = (seconds_since_start, datapath_id)
+        cache = self.stats_cache[cache_key]
+
+        # Check if all required data is available and not yet logged
+        if (
+            cache['rx_bytes_per_sec'] > 0.0 and
+            cache['tx_bytes_per_sec'] > 0.0 and
+            cache['cpu_util'] is not None and
+            not cache['logged']
+        ):
+            try:
+                cursor = self.db.cursor()
+                sql = """
+                    INSERT INTO experimentgunnot (seconds_since_start, real_timestamp, datapath_id,
+                    rx_bytes_per_sec, tx_bytes_per_sec, cpu_utilization)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(sql, (
+                    seconds_since_start,
+                    real_timestamp,
+                    datapath_id,
+                    cache['rx_bytes_per_sec'],
+                    cache['tx_bytes_per_sec'],
+                    cache['cpu_util']
+                ))
+                self.db.commit()
+                self.logger.debug(f"Logged to DB: {cursor.rowcount} row(s)")
+                cursor.close()
+                # Mark as logged to prevent duplicate entries
+                cache['logged'] = True
+            except Exception as e:
+                self.logger.error(f"DB insert failed: {e}")
 
     def _extract_instructions(self, stat):
         """Extract instructions from a flow stat."""
@@ -419,7 +486,23 @@ class FlowStatsHandler(app_manager.RyuApp):
             meter_id=self.meter_id,
             bands=bands
         ))
+
         self.logger.debug(f"Created meter {self.meter_id} for datapath {datapath.id}")
+
+    def add_flow(self, datapath, priority, match, actions, hard_timeout, idle_timeout):
+        """Add a flow entry to the datapath."""
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            hard_timeout=hard_timeout,
+            idle_timeout=idle_timeout
+        )
+        datapath.send_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def state_change_handler(self, ev):
@@ -432,11 +515,3 @@ class FlowStatsHandler(app_manager.RyuApp):
             self.datapaths.pop(datapath.id, None)
             self.logger.info(f"Datapath {datapath.id} disconnected")
 
-    def __del__(self):
-        """Clean up SSH and database connections."""
-        if self.ssh_client:
-            self.ssh_client.close()
-            self.logger.info("SSH connection closed")
-        if self.db:
-            self.db.close()
-            self.logger.info("DB connection closed")
