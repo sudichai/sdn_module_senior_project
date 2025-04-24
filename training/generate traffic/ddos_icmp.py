@@ -57,8 +57,8 @@ def generate_ddos_icmp(sender, receiver_ip, duration):
         elapsed_time = current_time - start_time
         progress = (elapsed_time / duration) * 100
         info(f"[Progress: {progress:.2f}%] {sender.IP()} -> {receiver_ip}: Burst ended\n")
-        
-        pause = random.uniform(30, 45)  # Shorter pauses for DDoS
+        pause = 1
+        #pause = random.uniform(30, 45)  # Shorter pauses for DDoS
         info(f"[{datetime.now()}] Pausing for {pause:.2f}s\n")
         time.sleep(pause)
 
@@ -90,8 +90,8 @@ def create_topology():
         ip='10.0.0.6/8', range=50, mem_limit='512m', cpu_shares=20, position='30,80,0')
 
     info("*** Adding Access Points\n")
-    net.addAccessPoint('ap1', ssid='ssid1', mode='g', channel=1, position='20,60,0', range=50)
-    net.addAccessPoint('ap2', ssid='ssid1', mode='g', channel=6, position='20,20,0', range=50)
+    net.addAccessPoint('ap1', ssid='ssid1', mode='g', channel=1, position='20,60,0', range=50, dpid="1")
+    net.addAccessPoint('ap2', ssid='ssid1', mode='g', channel=6, position='20,20,0', range=50, dpid="2")
 
     info("*** Adding controller\n")
     controller = net.addController('c0', controller=RemoteController, ip='127.0.0.1', port=6653)

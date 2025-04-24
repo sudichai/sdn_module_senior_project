@@ -49,20 +49,18 @@ class PacketInHandler:
                     icmp_pkt = pkt.get_protocol(icmp.icmp)
                     if icmp_pkt:
                         match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP,eth_dst=dst_mac, eth_src=src_mac,
-                                                ip_proto=protocol,
-                                                icmpv4_type=icmp_pkt.type, in_port=in_port)
-                    
+                                                ip_proto=protocol)#,in_port=in_port) #icmpv4_type=icmp_pkt.type )
                 elif protocol == 6:  # TCP
                     tcp_pkt = pkt.get_protocol(tcp.tcp)
                     if tcp_pkt:
                         match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP,eth_dst=dst_mac, eth_src=src_mac,
-                                                ip_proto=protocol,in_port=in_port)
+                                                ip_proto=protocol)#,in_port=in_port)
                                                 #tcp_src=tcp_pkt.src_port, tcp_dst=tcp_pkt.dst_port, 
                 elif protocol == 17:  # UDP
                     udp_pkt = pkt.get_protocol(udp.udp)
                     if udp_pkt:
                         match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP,eth_dst=dst_mac, eth_src=src_mac,
-                                                ip_proto=protocol,in_port=in_port)
+                                                ip_proto=protocol)#,in_port=in_port)
                                                 #udp_src=udp_pkt.src_port, udp_dst=udp_pkt.dst_port, 
                 else:
                     match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, in_port=in_port)
